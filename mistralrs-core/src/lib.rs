@@ -66,6 +66,7 @@ mod mla;
 mod models;
 mod paged_attention;
 mod pipeline;
+pub mod introspection;
 mod prefix_cacher;
 mod request;
 mod response;

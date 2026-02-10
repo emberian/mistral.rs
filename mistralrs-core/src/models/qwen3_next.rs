@@ -12,6 +12,41 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+// ====================== Introspection Support ======================
+
+/// State for introspection experiments: hidden state capture and steering vector injection.
+///
+/// When `capture` is true, the forward pass stores a clone of the hidden state tensor
+/// after the embedding layer (index 0) and after each decoder layer (indices 1..N).
+///
+/// Steering vectors in `steering_vectors` are added to the residual stream after the
+/// corresponding layer's forward pass, before the next layer.
+pub struct IntrospectionState {
+    /// Per-layer hidden states from the last forward pass.
+    /// Index 0 = after embedding, index i+1 = after decoder layer i.
+    pub hidden_states: Vec<Tensor>,
+    /// Steering vectors to add to the residual stream. Key = layer index.
+    pub steering_vectors: HashMap<usize, Tensor>,
+    /// Whether to capture hidden states on the next forward pass.
+    pub capture: bool,
+}
+
+impl IntrospectionState {
+    pub fn new() -> Self {
+        Self {
+            hidden_states: Vec::new(),
+            steering_vectors: HashMap::new(),
+            capture: false,
+        }
+    }
+}
+
+impl Default for IntrospectionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
@@ -1325,6 +1360,8 @@ pub struct Model {
     cfg: ModelConfigMetadata,
     num_attention_heads: usize,
     max_seq_len: usize,
+    /// Introspection state for activation capture and steering vector injection.
+    pub introspection: Arc<Mutex<IntrospectionState>>,
 }
 
 impl Model {
@@ -1560,6 +1597,7 @@ impl Model {
             mapper,
             num_attention_heads,
             max_seq_len: cfg.max_position_embeddings,
+            introspection: Arc::new(Mutex::new(IntrospectionState::new())),
         })
     }
 
@@ -1572,6 +1610,14 @@ impl Model {
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?;
+
+        // Introspection: capture embedding output
+        {
+            let mut intro = self.introspection.lock().unwrap();
+            if intro.capture {
+                intro.hidden_states.push(x.clone());
+            }
+        }
 
         let mut local_cache = self.local_cache.lock().unwrap();
 
@@ -1621,6 +1667,17 @@ impl Model {
                     }
                 }
             }
+
+            // Introspection: capture hidden state after this layer, inject steering vector
+            {
+                let mut intro = self.introspection.lock().unwrap();
+                if intro.capture {
+                    intro.hidden_states.push(x.clone());
+                }
+                if let Some(sv) = intro.steering_vectors.get(&layer_idx) {
+                    x = x.broadcast_add(sv)?;
+                }
+            }
         }
 
         let x = x.to_device(&self.device)?;
@@ -1634,6 +1691,110 @@ impl Model {
         let logits = MatMul.qmethod_matmul(&x, &*self.lm_head)?;
 
         Ok(logits)
+    }
+
+    // ====================== Introspection Methods ======================
+
+    /// Run a forward pass that captures hidden states at every layer.
+    /// Returns (logits, hidden_states) where:
+    ///   hidden_states[0] = after embedding
+    ///   hidden_states[i+1] = after decoder layer i
+    /// Total: num_hidden_layers + 1 entries.
+    pub fn forward_introspect(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        {
+            let mut intro = self.introspection.lock().unwrap();
+            intro.capture = true;
+            intro.hidden_states.clear();
+        }
+
+        let logits = self.forward(input_ids, seqlen_offsets, context_lens, metadata, flash_params)?;
+
+        let hidden_states = {
+            let mut intro = self.introspection.lock().unwrap();
+            intro.capture = false;
+            std::mem::take(&mut intro.hidden_states)
+        };
+
+        Ok((logits, hidden_states))
+    }
+
+    /// Project a hidden state through the final RMSNorm and lm_head ("logit lens").
+    /// Input: hidden state tensor of shape (..., hidden_size).
+    /// Output: logit tensor of shape (..., vocab_size).
+    pub fn logit_lens(&self, hidden_state: &Tensor) -> Result<Tensor> {
+        let h = self.norm.forward(hidden_state)?;
+        let mut h = h;
+        if let Some(t) = self.lm_head.quantized_act_type() {
+            h = h.to_dtype(t)?;
+        }
+        let logits = MatMul.qmethod_matmul(&h, &*self.lm_head)?;
+        if self.lm_head.quantized_act_type().is_some() {
+            Ok(logits.to_dtype(hidden_state.dtype())?)
+        } else {
+            Ok(logits)
+        }
+    }
+
+    /// Run logit lens on all captured hidden states from the last `forward_introspect()` call.
+    /// For each layer, projects the hidden state at the last sequence position through
+    /// norm + lm_head and returns softmax probabilities.
+    /// Returns Vec of (layer_index, probability_tensor) pairs.
+    pub fn logit_lens_all(&self, hidden_states: &[Tensor]) -> Result<Vec<Tensor>> {
+        let mut results = Vec::with_capacity(hidden_states.len());
+        for hs in hidden_states {
+            // Take the last token position: shape (batch, seq, hidden) -> (batch, hidden)
+            let last_pos = hs.i((.., hs.dim(1)? - 1, ..))?;
+            let logits = self.logit_lens(&last_pos)?;
+            let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
+            results.push(probs);
+        }
+        Ok(results)
+    }
+
+    /// Set a steering vector for a specific layer. The vector will be broadcast-added
+    /// to the residual stream after that layer's forward pass.
+    /// Shape should be broadcastable to (batch, seq_len, hidden_size).
+    pub fn set_steering_vector(&self, layer_idx: usize, vector: Tensor) {
+        let mut intro = self.introspection.lock().unwrap();
+        intro.steering_vectors.insert(layer_idx, vector);
+    }
+
+    /// Set steering vectors for a range of layers (same vector, scaled).
+    pub fn set_steering_vectors_range(
+        &self,
+        layer_range: std::ops::Range<usize>,
+        vector: &Tensor,
+        scale: f64,
+    ) -> Result<()> {
+        let scaled = (vector * scale)?;
+        let mut intro = self.introspection.lock().unwrap();
+        for layer_idx in layer_range {
+            intro.steering_vectors.insert(layer_idx, scaled.clone());
+        }
+        Ok(())
+    }
+
+    /// Clear all steering vectors.
+    pub fn clear_steering_vectors(&self) {
+        let mut intro = self.introspection.lock().unwrap();
+        intro.steering_vectors.clear();
+    }
+
+    /// Get the number of decoder layers.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Get the layer type (FullAttention or LinearAttention) for a given layer index.
+    pub fn layer_type(&self, idx: usize) -> &LayerType {
+        &self.layer_types[idx]
     }
 }
 
@@ -1743,6 +1904,29 @@ impl NormalModel for Model {
             flash_params,
         )
     }
+
+    fn introspection_state(
+        &self,
+    ) -> Option<Arc<Mutex<IntrospectionState>>> {
+        Some(self.introspection.clone())
+    }
+
+    fn forward_introspect(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        _position_ids: Vec<usize>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        self.forward_introspect(input_ids, seqlen_offsets, context_lens, metadata, flash_params)
+    }
+
+    fn logit_lens(&self, hidden_state: &Tensor) -> Result<Tensor> {
+        self.logit_lens(hidden_state)
+    }
+
     fn xlora_forward(
         &self,
         _input_ids: &Tensor,

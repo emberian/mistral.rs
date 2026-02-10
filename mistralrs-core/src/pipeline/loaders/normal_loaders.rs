@@ -70,6 +70,46 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
     fn cache_mut(&mut self) -> &mut EitherCache;
     fn max_seq_len(&self) -> usize;
     fn config(&self) -> &ModelConfigMetadata;
+
+    // ---- Introspection support (default: not available) ----
+
+    /// Returns the introspection state if this model supports activation capture
+    /// and steering vector injection. Default: None.
+    fn introspection_state(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::models::qwen3_next::IntrospectionState>>>
+    {
+        None
+    }
+
+    /// Run a forward pass that captures hidden states at every layer.
+    /// Default: falls back to normal forward, returns empty hidden states.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_introspect(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        position_ids: Vec<usize>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+    ) -> candle_core::Result<(Tensor, Vec<Tensor>)> {
+        let logits = self.forward(
+            input_ids,
+            seqlen_offsets,
+            context_lens,
+            position_ids,
+            metadata,
+            flash_params,
+        )?;
+        Ok((logits, Vec::new()))
+    }
+
+    /// Project a hidden state through the final norm and lm_head (logit lens).
+    /// Default: not supported.
+    fn logit_lens(&self, _hidden_state: &Tensor) -> candle_core::Result<Tensor> {
+        candle_core::bail!("logit_lens not supported for this model")
+    }
 }
 
 /// Metadata for loading a model with ISQ or device mapping.
