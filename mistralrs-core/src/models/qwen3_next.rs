@@ -29,6 +29,9 @@ pub struct IntrospectionState {
     pub steering_vectors: HashMap<usize, Tensor>,
     /// Whether to capture hidden states on the next forward pass.
     pub capture: bool,
+    /// If set, only capture at these layer indices (0 = embedding, 1..N = decoder layers).
+    /// None means capture all layers.
+    pub capture_layers: Option<std::collections::HashSet<usize>>,
 }
 
 impl IntrospectionState {
@@ -37,6 +40,7 @@ impl IntrospectionState {
             hidden_states: Vec::new(),
             steering_vectors: HashMap::new(),
             capture: false,
+            capture_layers: None,
         }
     }
 }
@@ -1611,10 +1615,10 @@ impl Model {
     ) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?;
 
-        // Introspection: capture embedding output
+        // Introspection: capture embedding output (layer index 0)
         {
             let mut intro = self.introspection.lock().unwrap();
-            if intro.capture {
+            if intro.capture && intro.capture_layers.as_ref().map_or(true, |s| s.contains(&0)) {
                 intro.hidden_states.push(x.clone());
             }
         }
@@ -1671,7 +1675,9 @@ impl Model {
             // Introspection: capture hidden state after this layer, inject steering vector
             {
                 let mut intro = self.introspection.lock().unwrap();
-                if intro.capture {
+                // layer_idx 0 in the loop = decoder layer 0 = capture index 1
+                let capture_idx = layer_idx + 1;
+                if intro.capture && intro.capture_layers.as_ref().map_or(true, |s| s.contains(&capture_idx)) {
                     intro.hidden_states.push(x.clone());
                 }
                 if let Some(sv) = intro.steering_vectors.get(&layer_idx) {
@@ -1745,15 +1751,26 @@ impl Model {
     /// Run logit lens on all captured hidden states from the last `forward_introspect()` call.
     /// For each layer, projects the hidden state at the last sequence position through
     /// norm + lm_head and returns softmax probabilities.
-    /// Returns Vec of (layer_index, probability_tensor) pairs.
     pub fn logit_lens_all(&self, hidden_states: &[Tensor]) -> Result<Vec<Tensor>> {
+        if hidden_states.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Extract last token position from each layer and stack into one tensor.
+        // This turns N sequential norm+matmul calls into one batched operation.
+        let last_positions: Vec<Tensor> = hidden_states
+            .iter()
+            .map(|hs| {
+                let seq_dim = hs.dim(1)?;
+                hs.i((.., seq_dim - 1, ..))?.squeeze(1)
+            })
+            .collect::<Result<_>>()?;
+        let stacked = Tensor::stack(&last_positions, 0)?; // (num_layers, hidden_size)
+        let logits = self.logit_lens(&stacked)?; // single batched matmul
+        let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
+        // Split back into per-layer tensors
         let mut results = Vec::with_capacity(hidden_states.len());
-        for hs in hidden_states {
-            // Take the last token position: shape (batch, seq, hidden) -> (batch, hidden)
-            let last_pos = hs.i((.., hs.dim(1)? - 1, ..))?;
-            let logits = self.logit_lens(&last_pos)?;
-            let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
-            results.push(probs);
+        for i in 0..hidden_states.len() {
+            results.push(probs.i(i)?);
         }
         Ok(results)
     }

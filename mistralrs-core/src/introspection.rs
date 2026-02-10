@@ -214,6 +214,29 @@ impl IntrospectionModel {
     ///
     /// Not safe to call concurrently — the caller must serialize access.
     pub fn forward_introspect(&self, text: &str) -> anyhow::Result<IntrospectionResult> {
+        self.forward_introspect_layers(text, None)
+    }
+
+    /// Run a forward pass capturing hidden states at specific layers only.
+    ///
+    /// `layers` specifies which layers to capture (0 = embedding, 1..N = decoder layers).
+    /// Pass `None` to capture all layers. Capturing fewer layers reduces memory copies
+    /// during the forward pass — significant on memory-bandwidth-bound systems.
+    pub fn forward_introspect_layers(
+        &self,
+        text: &str,
+        layers: Option<std::collections::HashSet<usize>>,
+    ) -> anyhow::Result<IntrospectionResult> {
+        // Set selective capture before the forward pass
+        {
+            let intro = self.model.introspection.lock().unwrap();
+            // Need to drop and re-acquire as mutable for the field write.
+            // (Interior mutability via Mutex means &self is fine.)
+            drop(intro);
+            let mut intro = self.model.introspection.lock().unwrap();
+            intro.capture_layers = layers;
+        }
+
         let encoding = self
             .tokenizer
             .encode(text, false)
@@ -238,6 +261,12 @@ impl IntrospectionModel {
             None,
             &flash_params,
         )?;
+
+        // Reset capture_layers
+        {
+            let mut intro = self.model.introspection.lock().unwrap();
+            intro.capture_layers = None;
+        }
 
         Ok(IntrospectionResult {
             logits,
